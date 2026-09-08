@@ -265,4 +265,38 @@ describe('Bootstrap template', () => {
       expect(Object.keys(template.Outputs).length).toBeGreaterThan(0);
     });
   });
+
+  // #864: CloudFormation accepts an inline template (`TemplateBody`) only up to
+  // 51,200 bytes. Past that the CDK CLI must stage it in S3 — which it cannot do
+  // while bootstrapping a fresh account, because that bucket is what bootstrap
+  // creates. The result is a hard `BootstrapStackRequired` failure with no
+  // workaround through `cdk bootstrap`, so template size is a correctness
+  // property of this artifact, not a nicety.
+  describe('Inline-template size limit', () => {
+    const rendered = readFileSync(templatePath, 'utf-8');
+    const CFN_INLINE_TEMPLATE_LIMIT = 51_200;
+    const TEMPLATE_SIZE_BUDGET = 48_000;
+
+    it('fits within the CloudFormation inline template limit', () => {
+      expect(rendered.length).toBeLessThanOrEqual(CFN_INLINE_TEMPLATE_LIMIT);
+    });
+
+    it('stays within the generator budget, leaving headroom for new statements', () => {
+      expect(rendered.length).toBeLessThanOrEqual(TEMPLATE_SIZE_BUDGET);
+    });
+
+    // The size win comes from emitting statements in flow style. That is only safe
+    // if it is purely a serialisation change, so assert the compact form parses to
+    // the same template a fully-expanded dump would.
+    it('is byte-compact without changing the parsed template', () => {
+      const expanded = yaml.dump(template, {
+        lineWidth: 120,
+        noRefs: true,
+        quotingType: "'",
+        forceQuotes: false,
+      });
+      expect(yaml.load(expanded)).toEqual(template);
+      expect(rendered.length).toBeLessThan(expanded.length);
+    });
+  });
 });

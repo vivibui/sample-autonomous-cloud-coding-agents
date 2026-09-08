@@ -231,11 +231,29 @@ template.Outputs.BootstrapPolicySet = {
 // --- Step 7: Write output ---
 mkdirSync(outputDir, { recursive: true });
 
+/**
+ * CloudFormation only accepts a template inline (`TemplateBody`) up to 51,200 bytes;
+ * past that it must come from S3. `cdk bootstrap` cannot do that on a fresh account —
+ * the bucket it would upload to is the thing bootstrap creates — so an oversized
+ * template makes first-time bootstrap fail outright with `BootstrapStackRequired`
+ * (#864). Keep a margin so a policy addition does not silently re-cross the line.
+ */
+const CFN_INLINE_TEMPLATE_LIMIT = 51_200;
+const TEMPLATE_SIZE_BUDGET = 48_000;
+
+/**
+ * `flowLevel` switches collections to inline flow style below the given nesting
+ * depth. At 6, IAM statement objects render one-per-line (`- {Action: …, Effect: …}`)
+ * instead of exploding each key and every action string onto its own line. That is
+ * the same YAML — verified by a round-trip equality test — for roughly 15 KB less,
+ * which is what brings the template under the inline limit with headroom.
+ */
 const yamlOutput = yaml.dump(template, {
   lineWidth: 120,
   noRefs: true,
   quotingType: "'",
   forceQuotes: false,
+  flowLevel: 6,
 });
 
 // Add a header comment
@@ -255,6 +273,26 @@ const header = [
   '',
 ].join('\n');
 
-writeFileSync(outputPath, header + yamlOutput);
+const rendered = header + yamlOutput;
 
-console.log(`Generated bootstrap template (v${BOOTSTRAP_VERSION}) -> ${outputPath}`);
+// Fail generation rather than emit a template that cannot bootstrap a fresh account.
+// Catching this here — at the point the bytes are produced — is what stops the failure
+// from being discovered later as an opaque CDK CLI error against a real account.
+if (rendered.length > TEMPLATE_SIZE_BUDGET) {
+  const overBudget = rendered.length - TEMPLATE_SIZE_BUDGET;
+  const overHardLimit = rendered.length > CFN_INLINE_TEMPLATE_LIMIT;
+  throw new Error(
+    `Bootstrap template is ${rendered.length} bytes, over the ${TEMPLATE_SIZE_BUDGET}-byte budget by ${overBudget}`
+    + ` (CloudFormation inline limit is ${CFN_INLINE_TEMPLATE_LIMIT}${overHardLimit ? ' — ALREADY EXCEEDED' : ''}).`
+    + ' A template past the inline limit cannot bootstrap a fresh account at all (#864).'
+    + ' Reduce policy statement count, consolidate overlapping statements, or scope more'
+    + ' compute-variant policies behind a Condition.',
+  );
+}
+
+writeFileSync(outputPath, rendered);
+
+console.log(
+  `Generated bootstrap template (v${BOOTSTRAP_VERSION}) -> ${outputPath}`
+  + ` [${rendered.length} bytes, ${TEMPLATE_SIZE_BUDGET - rendered.length} under budget]`,
+);
