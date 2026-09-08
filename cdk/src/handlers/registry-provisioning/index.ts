@@ -75,6 +75,24 @@ function registryIdFromArn(arn: string): string {
   return arn.includes('/') ? arn.split('/').pop()! : arn;
 }
 
+/** The `registryId` constraint enforced by the Agent Registry control plane. Mirrored
+ *  here so a physical id that never came from CreateRegistry can be recognised locally
+ *  instead of costing a round-trip that fails closed as a ValidationException. */
+const REGISTRY_ID_PATTERN
+  = /^(arn:aws(-[^:]+)?:agent-registry:[a-z0-9-]+:[0-9]{12}:registry\/)?[a-zA-Z0-9]{12,16}$/;
+
+/** Whether `physicalId` can name a real registry.
+ *
+ * CloudFormation still issues a Delete during rollback for a resource whose Create
+ * never returned — so the physical id may be a CFN placeholder rather than a registry
+ * id. Deleting by that id is not merely useless, it wedges the stack: the control
+ * plane rejects it with a ValidationException, which is neither "absent" nor
+ * retryable, so the resource lands in DELETE_FAILED and the enclosing stack can only
+ * be removed with `--retain-resources`. */
+function isRegistryId(physicalId: string | undefined): physicalId is string {
+  return physicalId !== undefined && REGISTRY_ID_PATTERN.test(physicalId);
+}
+
 function isRetryableDeleteError(err: unknown): boolean {
   return (
     err instanceof ConflictException
@@ -161,12 +179,21 @@ export async function onEvent(event: OnEventRequest): Promise<OnEventResponse> {
       return { PhysicalResourceId: registryId };
     }
     case 'Delete': {
-      const registryId = event.PhysicalResourceId!;
-      // The CDK Provider wrapper consumes its CREATE_FAILED marker before
-      // invoking this handler, so a validation error here is a real defect and
-      // must not be treated as an already-absent registry.
-      await requestRegistryDeletion(registryId);
-      return { PhysicalResourceId: registryId };
+      const physicalId = event.PhysicalResourceId;
+      // The Provider wrapper consumes its CREATE_FAILED marker before invoking this
+      // handler, so for a *failed* create the id is already sanitised. A *cancelled*
+      // create is the gap: when a sibling resource fails first, CloudFormation cancels
+      // this create before CreateRegistry returns, no marker is written, and rollback
+      // still issues a Delete carrying a placeholder id. Recognise that here rather
+      // than letting the control plane reject it and wedge the stack.
+      if (!isRegistryId(physicalId)) {
+        logger.info('delete is a no-op: physical id is not a registry id, so the registry was never created', {
+          physicalId,
+        });
+        return { PhysicalResourceId: physicalId ?? 'registry-never-created' };
+      }
+      await requestRegistryDeletion(physicalId);
+      return { PhysicalResourceId: physicalId };
     }
   }
 }
@@ -174,6 +201,11 @@ export async function onEvent(event: OnEventRequest): Promise<OnEventResponse> {
 export async function isComplete(event: IsCompleteRequest): Promise<IsCompleteResponse> {
   const registryId = event.PhysicalResourceId;
   if (event.RequestType === 'Delete') {
+    // Mirror onEvent's guard: the Provider polls isComplete after onEvent, so a
+    // never-created registry would otherwise reach GetRegistry with a placeholder id
+    // and fail closed here instead — the same DELETE_FAILED wedge, one step later.
+    if (!isRegistryId(registryId)) return { IsComplete: true };
+
     let status: string;
     let statusReason: string | undefined;
     try {

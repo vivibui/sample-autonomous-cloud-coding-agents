@@ -220,6 +220,38 @@ describe('onEvent Delete', () => {
       }),
     ).rejects.toThrow('AccessDenied');
   });
+
+  // A cancelled create (a sibling resource failed first, so CreateRegistry never
+  // returned) still gets a Delete during rollback, carrying a CFN placeholder rather
+  // than a registry id. Calling DeleteRegistry with it earns a ValidationException,
+  // which is neither absent nor retryable — the resource sticks in DELETE_FAILED and
+  // the stack then needs `--retain-resources` to remove at all.
+  test.each([
+    ['a CFN failure marker', 'backgroundagent-dev-AgentRegistryStack-create-failed'],
+    ['a logical id', 'AgentRegistry5D423F2A'],
+    ['an empty string', ''],
+    ['undefined', undefined],
+  ])('treats a Delete for a never-created registry (%s) as a no-op', async (_label, physicalId) => {
+    routeSend({});
+    await expect(
+      onEvent({
+        RequestType: 'Delete',
+        PhysicalResourceId: physicalId,
+        ResourceProperties: { RegistryName: 'abca' },
+      }),
+    ).resolves.toBeDefined();
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  test('still deletes when the physical id is a full registry ARN', async () => {
+    routeSend({ DeleteRegistry: () => ({ status: 'DELETING' }) });
+    await onEvent({
+      RequestType: 'Delete',
+      PhysicalResourceId: ARN,
+      ResourceProperties: { RegistryName: 'abca' },
+    });
+    expect(mockSend).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('isComplete Create/Update', () => {
@@ -259,6 +291,21 @@ describe('isComplete Create/Update', () => {
 });
 
 describe('isComplete Delete', () => {
+  // Companion to the onEvent no-op guard: the Provider polls isComplete after
+  // onEvent, so a never-created registry must terminate here too rather than
+  // reaching GetRegistry with a placeholder id.
+  test('reports a never-created registry as already deleted without calling GetRegistry', async () => {
+    routeSend({});
+    await expect(
+      isComplete({
+        RequestType: 'Delete',
+        PhysicalResourceId: 'AgentRegistry5D423F2A',
+        ResourceProperties: { RegistryName: 'abca' },
+      }),
+    ).resolves.toEqual({ IsComplete: true });
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
   test('is complete once GetRegistry 404s (registry gone)', async () => {
     routeSend({
       GetRegistry: () => {
