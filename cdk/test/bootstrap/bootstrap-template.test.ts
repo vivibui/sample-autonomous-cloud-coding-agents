@@ -17,16 +17,34 @@
  *  SOFTWARE.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import * as yaml from 'js-yaml';
 
+import { buildTemplate, renderTemplate } from '../../scripts/generate-bootstrap-template';
+import {
+  CFN_INLINE_TEMPLATE_LIMIT,
+  TEMPLATE_SIZE_BUDGET,
+  cloudFormationBodySize,
+} from '../../src/bootstrap/template-size';
 import { BOOTSTRAP_VERSION, computeBootstrapHash } from '../../src/bootstrap/version';
 
 const templatePath = join(__dirname, '..', '..', 'bootstrap', 'bootstrap-template.yaml');
 
 const template: any = yaml.load(readFileSync(templatePath, 'utf-8'));
+
+/**
+ * ABCA policy documents are emitted as minified JSON strings (#864), so a test that
+ * wants at the statements has to parse first. Scoped to our own policies: the default
+ * CDK template also ships `CdkBoostrapPermissionsBoundaryPolicy`, which stays a mapping.
+ */
+function abcaPolicyDocument(logicalId: string): any {
+  const doc = template.Resources[logicalId].Properties.PolicyDocument;
+  expect(typeof doc).toBe('string');
+  return JSON.parse(doc);
+}
 
 describe('Bootstrap template', () => {
   describe('Parameters', () => {
@@ -74,10 +92,9 @@ describe('Bootstrap template', () => {
         expect(template.Resources[logicalId]).toBeDefined();
         expect(template.Resources[logicalId].Type).toBe('AWS::IAM::ManagedPolicy');
         expect(template.Resources[logicalId].Properties.PolicyDocument).toBeDefined();
-        expect(template.Resources[logicalId].Properties.PolicyDocument.Statement).toBeDefined();
-        expect(
-          template.Resources[logicalId].Properties.PolicyDocument.Statement.length,
-        ).toBeGreaterThan(0);
+        const doc = abcaPolicyDocument(logicalId);
+        expect(doc.Statement).toBeDefined();
+        expect(doc.Statement.length).toBeGreaterThan(0);
       });
     }
 
@@ -97,8 +114,8 @@ describe('Bootstrap template', () => {
       // CDK-managed image path depends on this statement reaching the YAML with no
       // Condition key. It lives in the CONDITIONAL per-backend policy, so an
       // agentcore-only bootstrap never gains the unconditioned pass at all.
-      const statements = template.Resources.IaCRoleABCAComputeLambdaMicrovms
-        .Properties.PolicyDocument.Statement as Array<{
+      const statements = abcaPolicyDocument('IaCRoleABCAComputeLambdaMicrovms')
+        .Statement as Array<{
         Sid: string;
         Action: string | string[];
         Resource: string | string[];
@@ -266,37 +283,89 @@ describe('Bootstrap template', () => {
     });
   });
 
-  // #864: CloudFormation accepts an inline template (`TemplateBody`) only up to
-  // 51,200 bytes. Past that the CDK CLI must stage it in S3 — which it cannot do
-  // while bootstrapping a fresh account, because that bucket is what bootstrap
-  // creates. The result is a hard `BootstrapStackRequired` failure with no
-  // workaround through `cdk bootstrap`, so template size is a correctness
-  // property of this artifact, not a nicety.
+  // #864: `cdk bootstrap --template <file>` does NOT send the bytes on disk. It parses
+  // the file, discards its formatting, and re-serialises the parsed object with the
+  // CLI's own writer before deciding inline-vs-S3:
+  //
+  //   const templateJson = toYAML(overrideTemplate ?? stack.template);
+  //   if (templateJson.length <= LARGE_TEMPLATE_SIZE_KB * 1024) ...
+  //
+  // Over the limit the CLI must stage in S3, which is impossible while bootstrapping a
+  // fresh account (that bucket is what bootstrap creates), so it fails outright with
+  // `BootstrapStackRequired` — `--force` included. These tests therefore measure the
+  // CLI's serialisation of the committed artifact, which is the quantity that gates
+  // bootstrap. An earlier revision of this guard measured on-disk bytes and passed at
+  // 39,896 while the body CloudFormation received was 53,369.
   describe('Inline-template size limit', () => {
-    const rendered = readFileSync(templatePath, 'utf-8');
-    const CFN_INLINE_TEMPLATE_LIMIT = 51_200;
-    const TEMPLATE_SIZE_BUDGET = 48_000;
+    // Measured by invoking the CDK CLI on the committed artifact, so the assertion is
+    // the CLI's own number rather than a local reimplementation of its serialiser.
+    // Slower than reading the file, and deliberately so: the earlier revision of this
+    // guard read on-disk bytes, passed at 39,896, and shipped a template whose body was
+    // 53,369 — over the ceiling and unable to bootstrap a fresh account.
+    const cdkRoot = join(__dirname, '..', '..');
+    let bodySize: number;
 
-    it('fits within the CloudFormation inline template limit', () => {
-      expect(rendered.length).toBeLessThanOrEqual(CFN_INLINE_TEMPLATE_LIMIT);
+    beforeAll(() => {
+      bodySize = cloudFormationBodySize(templatePath, cdkRoot);
+    });
+
+    it('fits within the CloudFormation inline template limit as the CLI serialises it', () => {
+      expect(bodySize).toBeLessThanOrEqual(CFN_INLINE_TEMPLATE_LIMIT);
     });
 
     it('stays within the generator budget, leaving headroom for new statements', () => {
-      expect(rendered.length).toBeLessThanOrEqual(TEMPLATE_SIZE_BUDGET);
+      expect(bodySize).toBeLessThanOrEqual(TEMPLATE_SIZE_BUDGET);
     });
 
-    // The size win comes from emitting statements in flow style. That is only safe
-    // if it is purely a serialisation change, so assert the compact form parses to
-    // the same template a fully-expanded dump would.
-    it('is byte-compact without changing the parsed template', () => {
-      const expanded = yaml.dump(template, {
-        lineWidth: 120,
-        noRefs: true,
-        quotingType: "'",
-        forceQuotes: false,
-      });
-      expect(yaml.load(expanded)).toEqual(template);
-      expect(rendered.length).toBeLessThan(expanded.length);
+    // Reformatting the committed YAML cannot move the gated size, because the CLI parses
+    // the file and discards its layout. Locking that in stops a future contributor
+    // "fixing" a budget failure by reflowing the artifact, which is what #864's first
+    // attempted fix did.
+    it('is unaffected by the committed file\'s formatting', () => {
+      const compact = join(tmpdir(), 'abca-bootstrap-compact.yaml');
+      const expanded = join(tmpdir(), 'abca-bootstrap-expanded.yaml');
+      writeFileSync(compact, yaml.dump(template, { lineWidth: 120, noRefs: true, flowLevel: 4 }));
+      writeFileSync(expanded, yaml.dump(template, { lineWidth: -1, noRefs: true }));
+      try {
+        expect(readFileSync(compact, 'utf-8').length)
+          .not.toBe(readFileSync(expanded, 'utf-8').length); // differ on disk...
+        // ...yet the CLI hands CloudFormation the identical body for both.
+        expect(cloudFormationBodySize(compact, cdkRoot))
+          .toBe(cloudFormationBodySize(expanded, cdkRoot));
+      } finally {
+        rmSync(compact, { force: true });
+        rmSync(expanded, { force: true });
+      }
+    });
+
+    // Each PolicyDocument is emitted as a minified JSON string rather than a nested
+    // mapping: a string scalar survives the CLI's re-serialisation on one line, which
+    // is what brings the body under the ceiling. CloudFormation accepts either shape
+    // for this `Json`-typed property and IAM stores the string parsed.
+    it('emits every PolicyDocument as a JSON string that parses to a policy document', () => {
+      const abcaPolicies = Object.keys(template.Resources as Record<string, any>)
+        .filter((id) => id.startsWith('IaCRoleABCA'));
+      expect(abcaPolicies).toHaveLength(6);
+      for (const id of abcaPolicies) {
+        const parsed = abcaPolicyDocument(id);
+        expect(parsed.Version).toBe('2012-10-17');
+        expect(Array.isArray(parsed.Statement)).toBe(true);
+        expect(parsed.Statement.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  // Replaces an earlier round-trip assertion that compared a dump of the committed file
+  // against a load of that dump — i.e. `load(dump(x)) === x`, true for any object, and
+  // blind to the artifact drifting from its generator. Comparing against an
+  // independently built template is the check that actually has teeth.
+  describe('Artifact matches the generator', () => {
+    it('committed template deep-equals a freshly built one', () => {
+      expect(template).toEqual(buildTemplate());
+    });
+
+    it('committed file is byte-identical to a fresh render', () => {
+      expect(readFileSync(templatePath, 'utf-8')).toBe(renderTemplate());
     });
   });
 });
