@@ -321,14 +321,23 @@ describe('Bootstrap template', () => {
     // the file and discards its layout. Locking that in stops a future contributor
     // "fixing" a budget failure by reflowing the artifact, which is what #864's first
     // attempted fix did.
+    //
+    // Both renderings disable line folding (`lineWidth: -1`). Folding is deliberately
+    // out of scope: YAML line-folding is not byte-neutral when it wraps a long quoted
+    // scalar, and each PolicyDocument here is a multi-kilobyte JSON string, so a folded
+    // rendering can re-parse a character off. That is a property of YAML folding, not of
+    // the size gate, and conflating the two made an earlier version of this test fail by
+    // exactly one character. The committed artifact's own integrity is covered by the
+    // deep-equality check in "Artifact matches the generator".
     it('is unaffected by the committed file\'s formatting', () => {
       const compact = join(tmpdir(), 'abca-bootstrap-compact.yaml');
       const expanded = join(tmpdir(), 'abca-bootstrap-expanded.yaml');
-      writeFileSync(compact, yaml.dump(template, { lineWidth: 120, noRefs: true, flowLevel: 4 }));
+      writeFileSync(compact, yaml.dump(template, { lineWidth: -1, noRefs: true, flowLevel: 4 }));
       writeFileSync(expanded, yaml.dump(template, { lineWidth: -1, noRefs: true }));
       try {
+        // Substantially different on disk (roughly 38 KB versus 46 KB)...
         expect(readFileSync(compact, 'utf-8').length)
-          .not.toBe(readFileSync(expanded, 'utf-8').length); // differ on disk...
+          .toBeLessThan(readFileSync(expanded, 'utf-8').length);
         // ...yet the CLI hands CloudFormation the identical body for both.
         expect(cloudFormationBodySize(compact, cdkRoot))
           .toBe(cloudFormationBodySize(expanded, cdkRoot));
