@@ -32,6 +32,7 @@ import {
   ResourceNotFoundException,
   ThrottlingException,
   UpdateRegistryCommand,
+  ValidationException,
 } from '@aws-sdk/client-agent-registry-control';
 import { logger } from '../shared/logger';
 import { makeClient } from '../shared/ua';
@@ -75,21 +76,33 @@ function registryIdFromArn(arn: string): string {
   return arn.includes('/') ? arn.split('/').pop()! : arn;
 }
 
-/** The `registryId` constraint enforced by the Agent Registry control plane. Mirrored
- *  here so a physical id that never came from CreateRegistry can be recognised locally
- *  instead of costing a round-trip that fails closed as a ValidationException. */
+/** The `registryId` constraint enforced by the Agent Registry control plane, which
+ *  accepts a bare id or a full registry ARN. Mirrored here so a physical id that never
+ *  came from CreateRegistry can be recognised locally instead of costing a round-trip
+ *  that fails closed as a ValidationException.
+ *
+ *  The upper bound is deliberately looser than the service's current `{12,16}`. This is
+ *  a *positive* discriminator — anything it fails to match is treated as never-created
+ *  and skipped — so if AWS ever widens the id format, a tight bound here would silently
+ *  orphan real registries while CloudFormation reported DELETE_COMPLETE. Erring wide
+ *  costs at most one rejected API call; erring narrow leaks a billable resource. */
 const REGISTRY_ID_PATTERN
-  = /^(arn:aws(-[^:]+)?:agent-registry:[a-z0-9-]+:[0-9]{12}:registry\/)?[a-zA-Z0-9]{12,16}$/;
+  = /^(arn:aws(-[^:]+)?:agent-registry:[a-z0-9-]+:[0-9]{12}:registry\/)?[a-zA-Z0-9]{12,64}$/;
 
-/** Whether `physicalId` can name a real registry.
+/** Whether `physicalId` is shaped like something the control plane would accept.
  *
  * CloudFormation still issues a Delete during rollback for a resource whose Create
  * never returned — so the physical id may be a CFN placeholder rather than a registry
  * id. Deleting by that id is not merely useless, it wedges the stack: the control
  * plane rejects it with a ValidationException, which is neither "absent" nor
  * retryable, so the resource lands in DELETE_FAILED and the enclosing stack can only
- * be removed with `--retain-resources`. */
-function isRegistryId(physicalId: string | undefined): physicalId is string {
+ * be removed with `--retain-resources`.
+ *
+ * Returns a plain boolean rather than a `physicalId is string` predicate on purpose. A
+ * predicate would narrow the *false* branch to `undefined`, which is where both callers
+ * do their work — so the placeholder they log would be typed away despite being a
+ * non-empty string at runtime. */
+function isRegistryId(physicalId: string | undefined): boolean {
   return physicalId !== undefined && REGISTRY_ID_PATTERN.test(physicalId);
 }
 
@@ -115,6 +128,19 @@ async function requestRegistryDeletion(registryId: string): Promise<DeleteAttemp
     return 'started';
   } catch (err) {
     if (err instanceof ResourceNotFoundException) return 'absent';
+    // Defence in depth behind the shape guard, and deliberately Delete-only. The guard
+    // fails *open* on format drift (skips the call, leaks the registry); this fails open
+    // on a request the service rejects (recoverable, and visible in the log). They fail
+    // in opposite directions, so keeping both narrows the window either leaves. Create
+    // and Update stay strictly fail-closed, where a malformed request is a real defect
+    // that should fail the resource rather than be swallowed.
+    if (err instanceof ValidationException) {
+      logger.warn('registry delete treated as absent: service rejected the id', {
+        registryId,
+        error: String(err),
+      });
+      return 'absent';
+    }
     if (isRetryableDeleteError(err)) {
       logger.warn('registry deletion will be retried', {
         registryId,
@@ -180,31 +206,58 @@ export async function onEvent(event: OnEventRequest): Promise<OnEventResponse> {
     }
     case 'Delete': {
       const physicalId = event.PhysicalResourceId;
-      // The Provider wrapper consumes its CREATE_FAILED marker before invoking this
-      // handler, so for a *failed* create the id is already sanitised. A *cancelled*
-      // create is the gap: when a sibling resource fails first, CloudFormation cancels
-      // this create before CreateRegistry returns, no marker is written, and rollback
-      // still issues a Delete carrying a placeholder id. Recognise that here rather
+      // The framework already handles the clean case: `safeHandler` answers SUCCESS for a
+      // Delete whose physical id is CREATE_FAILED_PHYSICAL_ID_MARKER without invoking this
+      // handler at all, so a create that failed *inside onEvent* never reaches here.
+      //
+      // The gap is a create that never returned a physical id and never got that marker:
+      // when a sibling resource fails first, CloudFormation stops waiting on this one and
+      // marks it CREATE_FAILED, then rollback issues a Delete carrying whatever id it has
+      // — a MISSING_PHYSICAL_ID marker or another placeholder. Recognise that here rather
       // than letting the control plane reject it and wedge the stack.
       if (!isRegistryId(physicalId)) {
-        logger.info('delete is a no-op: physical id is not a registry id, so the registry was never created', {
+        // Inference, not a certainty: CloudFormation abandons the create rather than
+        // killing the Lambda, so CreateRegistry may have succeeded with its response
+        // going to a ResponseURL nobody reads. Skipping the delete can therefore orphan
+        // a real, billable registry — still the right trade against an unrecoverable
+        // stack, but warn-level because it is a leak, not a clean no-op.
+        logger.warn('registry delete skipped: physical id is not registry-shaped', {
           physicalId,
+          registryName: event.ResourceProperties.RegistryName,
         });
-        return { PhysicalResourceId: physicalId ?? 'registry-never-created' };
+        // Echo the id verbatim — never synthesize one. The Provider framework rejects a
+        // Delete response whose PhysicalResourceId differs from the request's, so
+        // inventing a value here would throw and produce the very DELETE_FAILED this
+        // branch exists to avoid. Returning `undefined` lets its own
+        // `defaultPhysicalResourceId` supply the request's value.
+        return { PhysicalResourceId: physicalId };
       }
-      await requestRegistryDeletion(physicalId);
+      // Normalise before the SDK call, matching what the Create branch stores. The
+      // service accepts either shape, so this is consistency rather than a fix — but it
+      // keeps a single form flowing to the API while the returned PhysicalResourceId
+      // stays byte-identical to the request, as the framework requires.
+      await requestRegistryDeletion(registryIdFromArn(physicalId!));
       return { PhysicalResourceId: physicalId };
     }
   }
 }
 
 export async function isComplete(event: IsCompleteRequest): Promise<IsCompleteResponse> {
-  const registryId = event.PhysicalResourceId;
+  // Normalise so a full ARN and a bare id reach the API identically, matching onEvent.
+  const registryId = registryIdFromArn(event.PhysicalResourceId);
   if (event.RequestType === 'Delete') {
     // Mirror onEvent's guard: the Provider polls isComplete after onEvent, so a
     // never-created registry would otherwise reach GetRegistry with a placeholder id
     // and fail closed here instead — the same DELETE_FAILED wedge, one step later.
-    if (!isRegistryId(registryId)) return { IsComplete: true };
+    // Logged for the same reason as onEvent's: reporting a delete complete without
+    // calling the service may be leaving a real registry behind.
+    if (!isRegistryId(event.PhysicalResourceId)) {
+      logger.warn('registry delete reported complete unverified: physical id is not registry-shaped', {
+        physicalId: event.PhysicalResourceId,
+        registryName: event.ResourceProperties.RegistryName,
+      });
+      return { IsComplete: true };
+    }
 
     let status: string;
     let statusReason: string | undefined;
