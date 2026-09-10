@@ -84,8 +84,11 @@ function registryIdFromArn(arn: string): string {
  *  The upper bound is deliberately looser than the service's current `{12,16}`. This is
  *  a *positive* discriminator — anything it fails to match is treated as never-created
  *  and skipped — so if AWS ever widens the id format, a tight bound here would silently
- *  orphan real registries while CloudFormation reported DELETE_COMPLETE. Erring wide
- *  costs at most one rejected API call; erring narrow leaks a billable resource. */
+ *  orphan real registries while CloudFormation reported DELETE_COMPLETE.
+ *
+ *  Erring wide is the cheaper direction: an id this admits but the service rejects
+ *  raises a ValidationException, which both Delete paths treat as absent, so the cost is
+ *  a rejected call and a warn. Erring narrow leaks a billable resource silently. */
 const REGISTRY_ID_PATTERN
   = /^(arn:aws(-[^:]+)?:agent-registry:[a-z0-9-]+:[0-9]{12}:registry\/)?[a-zA-Z0-9]{12,64}$/;
 
@@ -243,14 +246,17 @@ export async function onEvent(event: OnEventRequest): Promise<OnEventResponse> {
 }
 
 export async function isComplete(event: IsCompleteRequest): Promise<IsCompleteResponse> {
-  // Normalise so a full ARN and a bare id reach the API identically, matching onEvent.
-  const registryId = registryIdFromArn(event.PhysicalResourceId);
   if (event.RequestType === 'Delete') {
     // Mirror onEvent's guard: the Provider polls isComplete after onEvent, so a
     // never-created registry would otherwise reach GetRegistry with a placeholder id
     // and fail closed here instead — the same DELETE_FAILED wedge, one step later.
     // Logged for the same reason as onEvent's: reporting a delete complete without
     // calling the service may be leaving a real registry behind.
+    //
+    // Ordered before any normalisation deliberately. `registryIdFromArn` dereferences
+    // its argument, so normalising first would throw on an absent id instead of taking
+    // this branch — the declared type says that cannot happen, but the guard is here
+    // precisely for ids the declared type did not anticipate.
     if (!isRegistryId(event.PhysicalResourceId)) {
       logger.warn('registry delete reported complete unverified: physical id is not registry-shaped', {
         physicalId: event.PhysicalResourceId,
@@ -258,6 +264,9 @@ export async function isComplete(event: IsCompleteRequest): Promise<IsCompleteRe
       });
       return { IsComplete: true };
     }
+
+    // Normalise so a full ARN and a bare id reach the API identically, matching onEvent.
+    const registryId = registryIdFromArn(event.PhysicalResourceId);
 
     let status: string;
     let statusReason: string | undefined;
@@ -268,6 +277,18 @@ export async function isComplete(event: IsCompleteRequest): Promise<IsCompleteRe
     } catch (err) {
       if (err instanceof ResourceNotFoundException) return { IsComplete: true };
       if (isRetryableDeleteError(err)) return { IsComplete: false };
+      // Same fail-open as the delete path, and for the same reason: an id the guard
+      // admitted but the service rejects is not worth wedging the stack over. Without
+      // this, the widened bound could cost more than "one rejected API call" — it would
+      // rethrow into DELETE_FAILED. Delete-only; the Create/Update poll below stays
+      // fail-closed.
+      if (err instanceof ValidationException) {
+        logger.warn('registry delete treated as complete: service rejected the id', {
+          registryId,
+          error: String(err),
+        });
+        return { IsComplete: true };
+      }
       throw err;
     }
 
@@ -285,7 +306,9 @@ export async function isComplete(event: IsCompleteRequest): Promise<IsCompleteRe
     return { IsComplete: false };
   }
 
-  // Create / Update: wait for READY.
+  // Create / Update: wait for READY. Normalised for the same reason as the Delete path,
+  // and fail-closed throughout — on these paths a rejected id is a real defect.
+  const registryId = registryIdFromArn(event.PhysicalResourceId);
   const res = await client.send(new GetRegistryCommand({ registryId }));
   const status = res.status ?? '';
   if (status === 'READY') {

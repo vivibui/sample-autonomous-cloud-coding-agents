@@ -323,6 +323,119 @@ describe('onEvent Delete', () => {
   });
 });
 
+// N-1/N-2 from review round 2: both were mutation-proven gaps — deleting the isComplete
+// normalisation, or any of the three warns, left the suite green. The warns are not
+// cosmetic: they are what makes a skipped delete (a possible billable orphan) visible, so
+// nothing should be able to downgrade them to info or drop them with CI still passing.
+describe('isComplete Delete — normalisation and orphan visibility', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const loggerModule = require('../../../src/handlers/shared/logger') as {
+    logger: {
+      info: (m: string, d?: Record<string, unknown>) => void;
+      warn: (m: string, d?: Record<string, unknown>) => void;
+    };
+  };
+
+  let warnSpy: jest.SpyInstance;
+  let infoSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    warnSpy = jest.spyOn(loggerModule.logger, 'warn').mockImplementation(() => { /* silence */ });
+    infoSpy = jest.spyOn(loggerModule.logger, 'info').mockImplementation(() => { /* silence */ });
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    infoSpy.mockRestore();
+  });
+
+  test('passes the bare id to GetRegistry when given a full registry ARN', async () => {
+    routeSend({ GetRegistry: () => ({ status: 'DELETING' }) });
+    await isComplete({
+      RequestType: 'Delete',
+      PhysicalResourceId: ARN,
+      ResourceProperties: { RegistryName: 'abca' },
+    });
+    expect((mockSend.mock.calls[0][0] as TaggedCommand).input.registryId).toBe(REGISTRY_ID);
+  });
+
+  test('warns (not infos) when skipping the delete, naming the registry', async () => {
+    routeSend({});
+    await expect(
+      isComplete({
+        RequestType: 'Delete',
+        PhysicalResourceId: 'AWSCDK::CustomResourceProviderFramework::MISSING_PHYSICAL_ID',
+        ResourceProperties: { RegistryName: 'abca' },
+      }),
+    ).resolves.toEqual({ IsComplete: true });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][1]).toMatchObject({ registryName: 'abca' });
+    expect(infoSpy).not.toHaveBeenCalled();
+  });
+
+  test('treats a service-rejected id as complete rather than wedging the poll', async () => {
+    routeSend({
+      GetRegistry: () => {
+        throw new ValidationException();
+      },
+    });
+    await expect(
+      isComplete({
+        RequestType: 'Delete',
+        PhysicalResourceId: REGISTRY_ID,
+        ResourceProperties: { RegistryName: 'abca' },
+      }),
+    ).resolves.toEqual({ IsComplete: true });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('onEvent Delete — orphan visibility', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const loggerModule = require('../../../src/handlers/shared/logger') as {
+    logger: {
+      info: (m: string, d?: Record<string, unknown>) => void;
+      warn: (m: string, d?: Record<string, unknown>) => void;
+    };
+  };
+
+  let warnSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    warnSpy = jest.spyOn(loggerModule.logger, 'warn').mockImplementation(() => { /* silence */ });
+    jest.spyOn(loggerModule.logger, 'info').mockImplementation(() => { /* silence */ });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test('warns with the registry name when skipping the delete', async () => {
+    routeSend({});
+    await onEvent({
+      RequestType: 'Delete',
+      PhysicalResourceId: 'AWSCDK::CustomResourceProviderFramework::MISSING_PHYSICAL_ID',
+      ResourceProperties: { RegistryName: 'abca' },
+    });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][1]).toMatchObject({ registryName: 'abca' });
+  });
+
+  test('warns when the service rejects the id on the delete call', async () => {
+    routeSend({
+      DeleteRegistry: () => {
+        throw new ValidationException();
+      },
+    });
+    await onEvent({
+      RequestType: 'Delete',
+      PhysicalResourceId: REGISTRY_ID,
+      ResourceProperties: { RegistryName: 'abca' },
+    });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('isComplete Create/Update', () => {
   test('returns IsComplete once the registry is READY', async () => {
     routeSend({ GetRegistry: () => ({ status: 'READY', registryArn: ARN }) });
