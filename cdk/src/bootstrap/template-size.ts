@@ -43,6 +43,8 @@
 
 import { execFileSync } from 'node:child_process';
 
+import * as yaml from 'js-yaml';
+
 /**
  * `LARGE_TEMPLATE_SIZE_KB * 1024` in the CDK CLI — the ceiling above which a
  * template must come from S3 rather than inline `TemplateBody`.
@@ -79,25 +81,94 @@ const STDOUT_BUFFER_BYTES = STDOUT_BUFFER_MIB * 1024 * 1024;
  * Needs no AWS credentials and no network: `--show-template` only renders.
  */
 export function cloudFormationBodySize(templatePath: string, cwd: string): number {
-  const stdout = execFileSync(
-    'npx',
-    ['cdk', 'bootstrap', '--show-template', '--template', templatePath],
-    {
-      cwd,
-      encoding: 'utf-8',
-      maxBuffer: STDOUT_BUFFER_BYTES,
-      // `--show-template` writes progress to stderr; keep it off the test output.
-      stdio: ['ignore', 'pipe', 'ignore'],
-    },
-  );
+  let stdout: string;
+  try {
+    stdout = execFileSync(
+      'npx',
+      [
+        'cdk', 'bootstrap', '--show-template',
+        // `--no-ci` is load-bearing, not tidiness. In CI mode the CLI routes progress to
+        // *stdout* rather than stderr, so "Using bootstrapping template from <path>" gets
+        // counted as part of the body: 45,744 locally versus 45,812 with `CI=true`, and
+        // the delta tracks the path's length. `.github/workflows/build.yml` sets
+        // `CI: true`, so without this the measurement is inflated by a console line and
+        // varies with where the template happens to live.
+        '--no-ci',
+        // Notices are another stdout writer, and they hit the network.
+        '--no-notices',
+        '--template', templatePath,
+      ],
+      {
+        cwd,
+        encoding: 'utf-8',
+        maxBuffer: STDOUT_BUFFER_BYTES,
+        // Capture stderr rather than discarding it: without this a non-zero exit
+        // surfaces only as "Command failed", with the CLI's own explanation thrown away.
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+  } catch (err) {
+    const e = err as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string };
+    const stderr = e.stderr ? String(e.stderr).trim() : '';
+    throw new Error(
+      `cdk bootstrap --show-template failed for ${templatePath}: ${e.message ?? 'unknown error'}`
+      + (stderr ? `\nCLI stderr:\n${stderr}` : ''),
+    );
+  }
 
   // The CLI prints the body followed by a newline. The gate is on the body, so drop
   // exactly one trailing newline if present rather than counting the console artefact.
   const body = stdout.endsWith('\n') ? stdout.slice(0, -1) : stdout;
+
+  assertLooksLikeTemplate(body, templatePath);
 
   // `String.length` (UTF-16 code units), matching the CLI's own
   // `templateJson.length <= LARGE_TEMPLATE_SIZE_KB * 1024`. Not `Buffer.byteLength`:
   // code units are what the gate compares, so counting UTF-8 bytes would diverge from
   // the real decision the moment a non-ASCII character entered a policy.
   return body.length;
+}
+
+/**
+ * Refuse to report a size for something that is not a CloudFormation template.
+ *
+ * Without this the guard is satisfied by nonsense: an empty input renders as the string
+ * `null`, which measures 5 characters and sails under any budget. A guard that passes
+ * loudest when it has measured nothing is worse than no guard.
+ */
+function assertLooksLikeTemplate(body: string, templatePath: string): void {
+  const parsed = yaml.load(body) as { Resources?: unknown; Parameters?: unknown } | null;
+  const isObject = (v: unknown): boolean => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+  if (!isObject(parsed) || !isObject(parsed?.Resources) || !isObject(parsed?.Parameters)) {
+    throw new Error(
+      `cdk bootstrap --show-template did not return a CloudFormation template for ${templatePath}`
+      + ` (${body.length} chars, Resources/Parameters missing or not objects).`
+      + ' Measuring this would report a meaningless size.',
+    );
+  }
+}
+
+/** Outcome of the budget check, so the caller owns the failure message and the pure
+ *  decision can be unit-tested without invoking the CLI. */
+export interface BudgetVerdict {
+  readonly withinBudget: boolean;
+  readonly overBudgetBy: number;
+  readonly overHardLimit: boolean;
+}
+
+/**
+ * Compare a measured body size against the budget and the hard ceiling.
+ *
+ * Split out from the generator so the three interesting points — at budget, one over,
+ * and past the inline limit — are testable without shelling out to the CDK CLI. The
+ * guard previously had no test at all; the only way to exercise it was to make the real
+ * template too big.
+ */
+export function checkTemplateBudget(bodySize: number): BudgetVerdict {
+  return {
+    withinBudget: bodySize <= TEMPLATE_SIZE_BUDGET,
+    overBudgetBy: Math.max(0, bodySize - TEMPLATE_SIZE_BUDGET),
+    overHardLimit: bodySize > CFN_INLINE_TEMPLATE_LIMIT,
+  };
 }

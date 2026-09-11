@@ -26,7 +26,7 @@
  * Output: cdk/bootstrap/bootstrap-template.yaml
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import * as yaml from 'js-yaml';
@@ -42,6 +42,7 @@ import {
 import {
   CFN_INLINE_TEMPLATE_LIMIT,
   TEMPLATE_SIZE_BUDGET,
+  checkTemplateBudget,
   cloudFormationBodySize,
 } from '../src/bootstrap/template-size';
 import { BOOTSTRAP_VERSION, computeBootstrapHash } from '../src/bootstrap/version';
@@ -176,7 +177,7 @@ export function buildTemplate(): any {
         // template fits inline. As a mapping, the CLI's re-serialisation expands every
         // statement key and every action onto its own line and the body lands at 53,369,
         // over the 51,200 inline ceiling; a string scalar survives re-serialisation on one
-        // line and brings it to 45,378 (#864). No permission changes: IAM parses the string
+        // line and brings it to 45,743 (#864). No permission changes: IAM parses the string
         // and stores it as a normal policy document (verified end-to-end — CFN creates the
         // policy and `iam:GetPolicyVersion` returns parsed JSON, not a literal string).
         PolicyDocument: JSON.stringify(policyDoc),
@@ -300,30 +301,39 @@ function main(): void {
 
   const rendered = renderTemplate();
 
-  // Write first, then measure the artifact through the CDK CLI. The gated quantity is
-  // the CLI's re-serialisation of the *parsed file*, not these bytes and not the
-  // in-memory object either — dumping with js-yaml and re-parsing normalises some
-  // scalars, so the in-memory template under-reports. Measuring the committed file with
-  // the tool that makes the decision removes the guesswork; this guard exists because
-  // measuring a near-enough proxy is exactly what let #864 through.
-  writeFileSync(outputPath, rendered);
+  // Measure a temporary sibling, then rename on success. Writing the real artifact first
+  // would leave an over-budget template on disk after a failed run, so the next command
+  // that reads it — including `cdk bootstrap` — would use a file the generator rejected.
+  // A sibling rather than the OS temp dir keeps the rename atomic on one filesystem.
+  const stagingPath = `${outputPath}.tmp`;
+  writeFileSync(stagingPath, rendered);
 
-  const bodySize = cloudFormationBodySize(outputPath, join(__dirname, '..'));
+  let bodySize: number;
+  try {
+    // Gate on what CloudFormation actually receives, which is NOT `rendered`. The CLI
+    // re-serialises the parsed object and compares that; on-disk formatting is discarded.
+    // See src/bootstrap/template-size.ts for the CLI code path this mirrors.
+    bodySize = cloudFormationBodySize(stagingPath, join(__dirname, '..'));
 
-  if (bodySize > TEMPLATE_SIZE_BUDGET) {
-    const overBudget = bodySize - TEMPLATE_SIZE_BUDGET;
-    const overHardLimit = bodySize > CFN_INLINE_TEMPLATE_LIMIT;
-    throw new Error(
-      `Bootstrap template body is ${bodySize} chars as CloudFormation receives it, over the `
-      + `${TEMPLATE_SIZE_BUDGET}-char budget by ${overBudget} (inline limit is `
-      + `${CFN_INLINE_TEMPLATE_LIMIT}${overHardLimit ? ' \u2014 ALREADY EXCEEDED' : ''}).`
-      + ' Past the inline limit `cdk bootstrap` cannot bootstrap a fresh account at all (#864).'
-      + " Note this is the CLI's re-serialisation of the parsed template, so reformatting the"
-      + ' committed YAML will not move it \u2014 the *content* has to shrink: fewer or merged'
-      + ' statements, or more compute-variant policies behind a Condition. Verify with:'
-      + ' npx cdk bootstrap --show-template --template bootstrap/bootstrap-template.yaml | wc -c',
-    );
+    const verdict = checkTemplateBudget(bodySize);
+    if (!verdict.withinBudget) {
+      throw new Error(
+        `Bootstrap template body is ${bodySize} chars as CloudFormation receives it, over the `
+        + `${TEMPLATE_SIZE_BUDGET}-char budget by ${verdict.overBudgetBy} (inline limit is `
+        + `${CFN_INLINE_TEMPLATE_LIMIT}${verdict.overHardLimit ? ' \u2014 ALREADY EXCEEDED' : ''}).`
+        + ' Past the inline limit `cdk bootstrap` cannot bootstrap a fresh account at all (#864).'
+        + " Note this is the CLI's re-serialisation of the parsed template, so reformatting the"
+        + ' committed YAML will not move it \u2014 the *content* has to shrink: fewer or merged'
+        + ' statements, or more compute-variant policies behind a Condition. Verify with:'
+        + ' npx cdk bootstrap --show-template --no-ci --template bootstrap/bootstrap-template.yaml | wc -c',
+      );
+    }
+  } catch (err) {
+    rmSync(stagingPath, { force: true });
+    throw err;
   }
+
+  renameSync(stagingPath, outputPath);
 
   console.log(
     `Generated bootstrap template (v${BOOTSTRAP_VERSION}) -> ${outputPath}`
